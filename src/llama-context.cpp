@@ -1469,6 +1469,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch_ext & batch_inp) {
+    // a new round starts: clear the cancellation record of the previous round
+    cancel_cancelled        = false;
+    cancel_n_aborted_tokens = 0;
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1541,7 +1545,18 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
 
     if (!res) {
         switch (status) {
-            case GGML_STATUS_ABORTED:      return  2;
+            case GGML_STATUS_ABORTED:
+                // record the leftover resources of the aborted round
+                cancel_cancelled        = true;
+                cancel_n_aborted_tokens = n_tokens;
+                // release this round's temporary batch and reset round-level state so
+                // the next encode does not read stale state
+                balloc->reset();
+                n_queued_tokens    = 0;
+                t_compute_start_us = 0;
+                n_outputs          = 0;
+                output_swaps.clear();
+                return  2;
             case GGML_STATUS_ALLOC_FAILED: return -2;
             case GGML_STATUS_FAILED:       return -3;
             case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
@@ -1712,6 +1727,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
     }
+
+    // a new round starts: clear the cancellation record of the previous round
+    cancel_cancelled        = false;
+    cancel_n_aborted_tokens = 0;
 
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
@@ -1911,7 +1930,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
 
             switch (status) {
-                case GGML_STATUS_ABORTED:      return  2;
+                case GGML_STATUS_ABORTED:
+                    // record the leftover resources of the aborted round
+                    cancel_cancelled        = true;
+                    cancel_n_aborted_tokens = n_tokens_all;
+                    // release this round's temporary batch and reset round-level state so
+                    // the next decode does not read stale state
+                    balloc->reset();
+                    n_queued_tokens    = 0;
+                    t_compute_start_us = 0;
+                    n_outputs          = 0;
+                    output_swaps.clear();
+                    return  2;
                 case GGML_STATUS_ALLOC_FAILED: return -2;
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
@@ -3446,6 +3476,16 @@ void llama_context::perf_reset() {
     n_reused    = 0;
 }
 
+llama_cancel_stats llama_context::get_cancel_stats() const {
+    llama_cancel_stats stats = {};
+    stats.cancelled         = cancel_cancelled;
+    stats.n_queued_tokens   = (uint32_t) n_queued_tokens;
+    stats.n_batch_tokens    = balloc ? balloc->get_n_tokens() : 0;
+    stats.n_outputs         = n_outputs;
+    stats.n_aborted_tokens  = cancel_n_aborted_tokens;
+    return stats;
+}
+
 llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
@@ -4399,6 +4439,18 @@ void llama_perf_context_print(const llama_context * ctx) {
 
 void llama_perf_context_reset(llama_context * ctx) {
     ctx->perf_reset();
+}
+
+llama_cancel_stats llama_get_cancel_stats(const llama_context * ctx) {
+    llama_cancel_stats stats = {};
+
+    if (ctx == nullptr) {
+        return stats;
+    }
+
+    stats = ctx->get_cancel_stats();
+
+    return stats;
 }
 
 //

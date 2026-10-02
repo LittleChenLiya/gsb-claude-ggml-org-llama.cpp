@@ -196,6 +196,9 @@ struct llama_context {
 
     llama_memory_breakdown memory_breakdown() const;
 
+    // read-only snapshot of the resources held after a decode/encode
+    llama_cancel_stats get_cancel_stats() const;
+
     //
     // training
     //
@@ -404,4 +407,8 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // cancellation bookkeeping: snapshot of the resources held after the last decode/encode
+    bool     cancel_cancelled         = false; // last decode/encode was aborted
+    uint32_t cancel_n_aborted_tokens  = 0;     // tokens in the last aborted round (0 if none)
 };

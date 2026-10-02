@@ -153,6 +153,9 @@ public:
     // call once before splitting the batch to reset the internal state
     void split_reset();
 
+    // release the current batch state so the next decode starts fresh
+    void reset();
+
     // simple split, unknown number of sequence sets of unequal lengths
     llama_ubatch split_simple(uint32_t n_ubatch);
 

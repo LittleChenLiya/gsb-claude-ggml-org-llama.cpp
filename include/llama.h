@@ -1693,6 +1693,22 @@ extern "C" {
     LLAMA_API void                           llama_perf_context_print(const struct llama_context * ctx);
     LLAMA_API void                           llama_perf_context_reset(      struct llama_context * ctx);
 
+    // Read-only snapshot of the resources held by a context after a decode/encode.
+    // When llama_decode()/llama_encode() returns 2 (aborted), the context keeps the
+    // resources of the interrupted round until the next call. Use this to inspect the
+    // leftover state without modifying it.
+    struct llama_cancel_stats {
+        bool     cancelled;        // true if the last decode/encode was aborted
+        uint32_t n_queued_tokens;  // tokens queued for perf accounting since the last synchronize
+        uint32_t n_batch_tokens;   // tokens in the temporary batch currently held by the context
+        uint32_t n_outputs;        // outputs reserved by the last decode/encode
+        uint32_t n_aborted_tokens; // tokens in the last aborted round (0 if the last round succeeded)
+    };
+
+    // Returns a read-only snapshot of the resources held by the context after a
+    // decode/encode. The snapshot does not modify the context.
+    LLAMA_API struct llama_cancel_stats llama_get_cancel_stats(const struct llama_context * ctx);
+
     // NOTE: the following work only with samplers constructed via llama_sampler_chain_init
     LLAMA_API struct llama_perf_sampler_data llama_perf_sampler      (const struct llama_sampler * chain);
     LLAMA_API void                           llama_perf_sampler_print(const struct llama_sampler * chain);

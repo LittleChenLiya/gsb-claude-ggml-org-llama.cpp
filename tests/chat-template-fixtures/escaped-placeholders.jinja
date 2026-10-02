@@ -1,0 +1,1 @@
+{% for message in messages %}{{ message['role'] + ': ' + message['content'] + '\n' }}{% endfor %}{{ 'note: {{ intentional_literal }} came from the template' }}

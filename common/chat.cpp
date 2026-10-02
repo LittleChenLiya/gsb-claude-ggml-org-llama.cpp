@@ -902,12 +902,61 @@ common_reasoning_format common_reasoning_format_from_name(const std::string & fo
     throw std::runtime_error("Unknown reasoning format: " + format);
 }
 
+std::vector<common_chat_unconsumed_placeholder> common_chat_find_unconsumed_placeholders(
+        const jinja::string & rendered) {
+    // jinja delimiter pairs; any of these surviving in template-emitted output means
+    // the engine did not consume them (e.g. emitted from a string literal in the template)
+    static const std::pair<const char *, const char *> delims[] = {
+        {"{{", "}}"},
+        {"{%", "%}"},
+        {"{#", "#}"},
+    };
+    std::vector<common_chat_unconsumed_placeholder> result;
+    size_t base = 0; // byte offset of the current part within the fully rendered text
+    for (const auto & part : rendered.parts) {
+        // skip parts that originate from user input: legitimate text fragments that
+        // merely look like placeholders (e.g. a user pasting "{{ foo }}" in a message)
+        // must not be misreported
+        if (!part.is_input) {
+            const std::string & text = part.val;
+            size_t i = 0;
+            while (i < text.size()) {
+                size_t best_pos = std::string::npos;
+                size_t best     = std::size(delims);
+                for (size_t d = 0; d < std::size(delims); d++) {
+                    const size_t pos = text.find(delims[d].first, i);
+                    if (pos != std::string::npos && (best_pos == std::string::npos || pos < best_pos)) {
+                        best_pos = pos;
+                        best     = d;
+                    }
+                }
+                if (best == std::size(delims)) {
+                    break;
+                }
+                const size_t open_end  = best_pos + 2;
+                const size_t close_pos = text.find(delims[best].second, open_end);
+                if (close_pos == std::string::npos) {
+                    // unmatched opener: report the opener token itself
+                    result.push_back({text.substr(best_pos, 2), base + best_pos});
+                    i = open_end;
+                } else {
+                    result.push_back({text.substr(best_pos, close_pos + 2 - best_pos), base + best_pos});
+                    i = close_pos + 2;
+                }
+            }
+        }
+        base += part.val.size();
+    }
+    return result;
+}
+
 std::string common_chat_template_direct_apply_impl(
     const common_chat_template & tmpl,
     const autoparser::generation_params & inputs,
     const std::optional<json> & messages_override,
     const std::optional<json> & tools_override,
-    const std::optional<json> & additional_context) {
+    const std::optional<json> & additional_context,
+    std::vector<common_chat_unconsumed_placeholder> * unconsumed) {
     jinja::context ctx(tmpl.source());
 
     // messages_override is already built for this template, do not touch its content parts
@@ -955,20 +1004,41 @@ std::string common_chat_template_direct_apply_impl(
 
     std::string result = parts->as_string().str();
 
+    // diagnostics only: scan the rendered parts for unconsumed placeholders.
+    // this never modifies the rendered text; offsets are adjusted below to match
+    // the final (possibly bos/eos-trimmed) string.
+    std::vector<common_chat_unconsumed_placeholder> diags;
+    if (unconsumed) {
+        diags = common_chat_find_unconsumed_placeholders(parts->as_string());
+    }
+
     // TODO: improve this later
+    size_t prefix_trim = 0;
     if (inputs.add_bos && string_starts_with(result, tmpl.bos_token())) {
-        result = result.substr(tmpl.bos_token().size());
+        prefix_trim = tmpl.bos_token().size();
+        result = result.substr(prefix_trim);
     }
     if (inputs.add_eos && string_ends_with(result, tmpl.eos_token())) {
         result = result.substr(0, result.size() - tmpl.eos_token().size());
+    }
+    if (unconsumed) {
+        unconsumed->clear();
+        for (auto & diag : diags) {
+            if (diag.offset < prefix_trim || diag.offset - prefix_trim >= result.size()) {
+                continue; // placeholder fell into a trimmed region
+            }
+            diag.offset -= prefix_trim;
+            unconsumed->push_back(std::move(diag));
+        }
     }
     return result;
 }
 
 std::string common_chat_template_direct_apply(
     const common_chat_template & tmpl,
-    const autoparser::generation_params & inputs) {
-    return common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt);
+    const autoparser::generation_params & inputs,
+    std::vector<common_chat_unconsumed_placeholder> * unconsumed) {
+    return common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt, unconsumed);
 }
 
 std::string common_chat_template_generation_prompt_impl(
@@ -1222,6 +1292,16 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
     return std::nullopt;
 }
 
+static void common_chat_log_unconsumed_placeholders(const std::vector<common_chat_unconsumed_placeholder> & unconsumed) {
+    if (unconsumed.empty()) {
+        return;
+    }
+    LOG_WRN("chat template left %zu unconsumed placeholder(s) in the rendered prompt:\n", unconsumed.size());
+    for (const auto & diag : unconsumed) {
+        LOG_WRN("  offset %zu: %s\n", diag.offset, diag.text.c_str());
+    }
+}
+
 static common_chat_params common_chat_templates_apply_jinja(const struct common_chat_templates *        tmpls,
                                                             const struct common_chat_templates_inputs & inputs) {
     autoparser::generation_params params;
@@ -1318,7 +1398,9 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         common_chat_params data;
         auto params_copy               = params;
         params_copy.reasoning_format   = COMMON_REASONING_FORMAT_NONE;
-        data.prompt                    = common_chat_template_direct_apply_impl(tmpl, params_copy);
+        data.prompt                    = common_chat_template_direct_apply_impl(tmpl, params_copy, std::nullopt,
+                std::nullopt, std::nullopt, &data.unconsumed_placeholders);
+        common_chat_log_unconsumed_placeholders(data.unconsumed_placeholders);
         data.generation_prompt         = common_chat_template_generation_prompt_impl(tmpl, params);
         data.format                    = COMMON_CHAT_FORMAT_PEG_NATIVE;
         auto parser                    = build_chat_peg_parser([&data](common_chat_peg_builder &p) {
@@ -1349,6 +1431,7 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         auto_params.message_delimiters = std::move(delimiters);
 
         auto_params.supports_thinking = autoparser.reasoning.mode != autoparser::reasoning_mode::NONE;
+        common_chat_log_unconsumed_placeholders(auto_params.unconsumed_placeholders);
         if (auto_params.supports_thinking) {
             auto_params.thinking_start_tag = trim_whitespace(autoparser.reasoning.start);
             auto end_tag = trim_whitespace(autoparser.reasoning.end);

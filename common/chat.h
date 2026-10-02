@@ -266,6 +266,21 @@ struct common_chat_templates_inputs {
     bool                                  force_pure_content = false;
 };
 
+// Diagnostic info about a placeholder-like fragment (e.g. "{{ ... }}", "{% ... %}"
+// or "{# ... #}") that survived chat template rendering and is still present in the
+// rendered prompt. Purely advisory: computing it never modifies the rendered text.
+struct common_chat_unconsumed_placeholder {
+    std::string text;     // the placeholder fragment as it appears in the rendered prompt
+    size_t      offset;   // byte offset of the fragment within the rendered prompt
+};
+
+// Scan rendered template output (with input provenance) for unconsumed placeholders.
+// Only parts of the output that originate from the template itself are scanned; parts
+// that originate from user input (message contents, template kwargs, ...) are skipped,
+// so legitimate user text that merely looks like a placeholder is not reported.
+std::vector<common_chat_unconsumed_placeholder> common_chat_find_unconsumed_placeholders(
+        const jinja::string & rendered);
+
 struct common_chat_params {
     common_chat_format                  format = COMMON_CHAT_FORMAT_CONTENT_ONLY;
     std::string                         prompt;
@@ -280,6 +295,8 @@ struct common_chat_params {
     std::vector<std::string>            additional_stops;
     std::string                         parser;
     common_chat_msg_delimiters          message_delimiters;
+    // diagnostics: placeholder fragments left in `prompt` after template expansion
+    std::vector<common_chat_unconsumed_placeholder> unconsumed_placeholders;
 };
 
 // per-message parsing syntax
@@ -368,7 +385,8 @@ std::map<std::string, bool> common_chat_templates_get_caps(const common_chat_tem
 
 std::string common_chat_template_direct_apply(
     const common_chat_template & tmpl,
-    const autoparser::generation_params & inputs);
+    const autoparser::generation_params & inputs,
+    std::vector<common_chat_unconsumed_placeholder> * unconsumed = nullptr);
 
 std::string common_chat_template_generation_prompt(
     const common_chat_template &          tmpl,

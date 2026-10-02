@@ -10,7 +10,40 @@
 #include <cassert>
 #include <cstring>
 #include <algorithm>
+#include <map>
 #include <sstream>
+
+// llama_batch_slot_report
+
+std::string llama_batch_slot_report::to_string() const {
+    if (ok()) {
+        return "no slot conflicts";
+    }
+
+    std::stringstream ss;
+
+    for (const auto & c : conflicts) {
+        ss << "duplicate slot: seq_id = " << c.seq_id << ", pos = [" << c.pos[0];
+        for (size_t j = 1; j < c.pos.size(); ++j) {
+            ss << ", " << c.pos[j];
+        }
+        ss << "], used by batch indices [";
+        for (size_t k = 0; k < c.idxs.size(); ++k) {
+            ss << (k == 0 ? "" : ", ") << c.idxs[k];
+        }
+        ss << "]\n";
+    }
+
+    for (const auto & o : invalid) {
+        ss << "out-of-range slot: batch index " << o.idx << ", seq_id = " << o.seq_id << ", pos = [" << o.pos[0];
+        for (size_t j = 1; j < o.pos.size(); ++j) {
+            ss << ", " << o.pos[j];
+        }
+        ss << "]\n";
+    }
+
+    return ss.str();
+}
 
 llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {
     const char * LLAMA_BATCH_DEBUG = getenv("LLAMA_BATCH_DEBUG");
@@ -66,6 +99,17 @@ bool llama_batch_allocr::init(
     if (!has_token && !has_embd) {
         LLAMA_LOG_ERROR("%s: batch has neither token ids nor embeddings\n", __func__);
         return false;
+    }
+
+    //
+    // slot conflict precheck (dry-run): report duplicate (seq_id, pos) slot combinations and
+    // out-of-range slots before anything is committed. the precheck only reports - it does not
+    // change which batches are accepted, so the inference path of valid batches is unchanged.
+    // out-of-range slots are still rejected by the dedicated checks further below.
+    //
+
+    if (const auto report = batch_inp.precheck_slots(); !report.ok()) {
+        LLAMA_LOG_WARN("%s: slot conflict precheck:\n%s", __func__, report.to_string().c_str());
     }
 
     //
@@ -1067,6 +1111,51 @@ void llama_batch_ext::clear() {
     tokens.clear();
     embd  .clear();
     n_embd = 0;
+}
+
+llama_batch_slot_report llama_batch_ext::precheck_slots() const {
+    llama_batch_slot_report res;
+
+    using slot_t = std::pair<llama_seq_id, std::array<llama_pos, GGML_MROPE_SECTIONS>>;
+
+    // slot -> batch indices that occupy it
+    std::map<slot_t, std::vector<int32_t>> slots;
+
+    for (int32_t i = 0; i < (int32_t) tokens.size(); ++i) {
+        const auto & t = tokens[i];
+
+        // number of position components that identify the slot of this entry
+        const size_t n_pos = t.id != LLAMA_TOKEN_NULL ? 1 : n_pos_per_embd;
+
+        std::array<llama_pos, GGML_MROPE_SECTIONS> pos = {0, 0, 0, 0};
+        for (size_t j = 0; j < n_pos && j < pos.size(); ++j) {
+            pos[j] = t.pos[j];
+        }
+
+        bool pos_ok = true;
+        for (size_t j = 0; j < n_pos && j < pos.size(); ++j) {
+            if (pos[j] < 0) {
+                pos_ok = false;
+            }
+        }
+
+        for (const auto sid : t.seq_ids) {
+            if (sid < 0 || sid >= n_seq_max || !pos_ok) {
+                res.invalid.push_back({i, sid, pos});
+                continue;
+            }
+
+            slots[{sid, pos}].push_back(i);
+        }
+    }
+
+    for (const auto & [slot, idxs] : slots) {
+        if (idxs.size() > 1) {
+            res.conflicts.push_back({slot.first, slot.second, idxs});
+        }
+    }
+
+    return res;
 }
 
 int32_t llama_batch_ext::add_token(llama_seq_id seq_id) {

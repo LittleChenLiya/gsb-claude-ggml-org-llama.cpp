@@ -1042,6 +1042,155 @@ static void test_mtp_embd_width(testing & t) {
     });
 }
 
+static void test_slot_precheck(testing & t) {
+    llama_vocab vocab;
+
+    t.test("valid_batch", [&](testing & t) {
+        mock_memory mem;
+
+        batch_builder bb(2, &mem);
+        bb.add(0, {0}, false);
+        bb.add(1, {0}, true);
+        bb.add(0, {1}, false);
+        bb.add(1, {1}, true);
+
+        const auto report = bb.b.precheck_slots();
+        t.assert_true("no conflicts",   report.ok());
+        t.assert_true("no duplicates",  report.conflicts.empty());
+        t.assert_true("no out-of-range", report.invalid.empty());
+        t.assert_equal("no slot conflicts", report.to_string());
+
+        // the precheck is a dry-run: it must not commit anything
+        t.assert_equal("batch unchanged", (size_t) 4, bb.b.tokens.size());
+        t.assert_true("memory untouched", mem.ranges.empty());
+
+        // the inference path of a valid batch is unchanged
+        llama_batch_allocr ba(1);
+        t.assert_true("init accepts valid batch", ba.init(bb.b, vocab, false));
+        t.assert_equal(4u, ba.get_n_tokens());
+        t.assert_equal(2u, ba.get_n_outputs());
+    });
+
+    t.test("coupled_seqs_share_token_not_slot", [&](testing & t) {
+        // a token assigned to multiple sequences occupies one slot per sequence - not a conflict
+        batch_builder bb;
+        bb.add(0, {0, 1}, false);
+        bb.add(1, {0, 1}, true);
+
+        const auto report = bb.b.precheck_slots();
+        t.assert_true("no conflicts", report.ok());
+
+        llama_batch_allocr ba(1);
+        t.assert_true("init accepts coupled batch", ba.init(bb.b, vocab, false));
+    });
+
+    t.test("duplicate_slot", [&](testing & t) {
+        batch_builder bb;
+        bb.add(5, {0}, false);
+        bb.add(5, {0}, true); // duplicate of (seq 0, pos 5)
+        bb.add(0, {1}, true);
+
+        const auto report = bb.b.precheck_slots();
+        t.assert_true("conflict detected", !report.ok());
+        t.assert_equal("one conflict", (size_t) 1, report.conflicts.size());
+        t.assert_equal(0, (int) report.conflicts[0].seq_id);
+        t.assert_equal(5, (int) report.conflicts[0].pos[0]);
+        t.assert_equal("two competitors", (size_t) 2, report.conflicts[0].idxs.size());
+        t.assert_equal(0, (int) report.conflicts[0].idxs[0]);
+        t.assert_equal(1, (int) report.conflicts[0].idxs[1]);
+        t.assert_true("no out-of-range", report.invalid.empty());
+
+        // the report points out the duplicated sequence and position combination
+        t.assert_true("report mentions seq",  report.to_string().find("seq_id = 0") != std::string::npos);
+        t.assert_true("report mentions pos",  report.to_string().find("pos = [5")  != std::string::npos);
+        t.assert_true("report mentions idxs", report.to_string().find("[0, 1]")     != std::string::npos);
+
+        // the precheck is a dry-run: the conflicting batch is left untouched
+        t.assert_equal("batch unchanged", (size_t) 3, bb.b.tokens.size());
+
+        // the precheck only reports - init() still accepts the batch, so the inference
+        // path of batches that were valid before stays unchanged
+        llama_batch_allocr ba(1);
+        t.assert_true("init still accepts (report-only precheck)", ba.init(bb.b, vocab, false));
+        t.assert_equal(3u, ba.get_n_tokens());
+    });
+
+    t.test("duplicate_slot_mrope", [&](testing & t) {
+        // embedding batch with n_pos_per_embd = 4: the full position tuple identifies the slot
+        batch_builder bb(2, nullptr, 4, 4);
+
+        const llama_pos pa[GGML_MROPE_SECTIONS] = { 3, 1, 2, 0 };
+        const llama_pos pb[GGML_MROPE_SECTIONS] = { 3, 1, 3, 0 };
+
+        bb.add_embd(pa, {0}, false);
+        bb.add_embd(pb, {0}, false); // same pos[0], different pos[2] -> different slot
+        bb.add_embd(pa, {0}, true);  // exact duplicate of the first entry
+
+        const auto report = bb.b.precheck_slots();
+        t.assert_equal("one conflict", (size_t) 1, report.conflicts.size());
+        t.assert_equal(3, (int) report.conflicts[0].pos[0]);
+        t.assert_equal(2, (int) report.conflicts[0].pos[2]);
+        t.assert_equal((size_t) 2, report.conflicts[0].idxs.size());
+        t.assert_equal(0, (int) report.conflicts[0].idxs[0]);
+        t.assert_equal(2, (int) report.conflicts[0].idxs[1]);
+
+        llama_batch_allocr ba(4);
+        t.assert_true("init still accepts (report-only precheck)", ba.init(bb.b, vocab, false));
+    });
+
+    t.test("out_of_range_slot", [&](testing & t) {
+        {
+            // seq_id >= n_seq_max (add_token refuses it, so poke the entry directly)
+            batch_builder bb;
+            const int32_t idx = bb.add(0, {0}, true);
+            bb.b.tokens[idx].seq_ids = { 7 };
+
+            const auto report = bb.b.precheck_slots();
+            t.assert_true("out-of-range detected", !report.ok());
+            t.assert_equal("no conflicts", (size_t) 0, report.conflicts.size());
+            t.assert_equal("one invalid", (size_t) 1, report.invalid.size());
+            t.assert_equal(0, (int) report.invalid[0].idx);
+            t.assert_equal(7, (int) report.invalid[0].seq_id);
+
+            llama_batch_allocr ba(1);
+            t.assert_true("init rejects out-of-range seq_id", !ba.init(bb.b, vocab, false));
+        }
+        {
+            // negative position
+            batch_builder bb;
+            const int32_t idx = bb.add(0, {0}, true);
+            bb.b.tokens[idx].pos[0] = -2;
+
+            const auto report = bb.b.precheck_slots();
+            t.assert_true("out-of-range detected", !report.ok());
+            t.assert_equal("one invalid", (size_t) 1, report.invalid.size());
+            t.assert_equal(0,  (int) report.invalid[0].idx);
+            t.assert_equal(-2, (int) report.invalid[0].pos[0]);
+
+            llama_batch_allocr ba(1);
+            t.assert_true("init rejects negative pos", !ba.init(bb.b, vocab, false));
+        }
+        {
+            // mixed batch: valid entries, a duplicate and an out-of-range slot
+            batch_builder bb;
+            bb.add(0, {0}, false);
+            bb.add(0, {0}, false);          // duplicate of (seq 0, pos 0)
+            const int32_t idx = bb.add(1, {0}, true);
+            bb.b.tokens[idx].seq_ids = { 9 }; // out of range
+
+            const auto report = bb.b.precheck_slots();
+            t.assert_true(!report.ok());
+            t.assert_equal("one conflict", (size_t) 1, report.conflicts.size());
+            t.assert_equal("one invalid",  (size_t) 1, report.invalid.size());
+            t.assert_equal(2, (int) report.invalid[0].idx);
+            t.assert_equal(9, (int) report.invalid[0].seq_id);
+
+            llama_batch_allocr ba(1);
+            t.assert_true("init rejects mixed batch", !ba.init(bb.b, vocab, false));
+        }
+    });
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -1058,6 +1207,7 @@ int main(int argc, char ** argv) {
     }
 
     t.test("init",           test_init);
+    t.test("slot_precheck",  test_slot_precheck);
     t.test("content_types",  test_content_types);
     t.test("compat",         test_compat);
     t.test("split",          test_split);

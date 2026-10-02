@@ -6,6 +6,7 @@
 #include "llama-cparams.h"
 
 #include <array>
+#include <string>
 #include <vector>
 #include <set>
 #include <bitset>
@@ -72,6 +73,32 @@ struct llama_ubatch {
 
 struct llama_hparams;
 
+// result of the slot conflict precheck, see llama_batch_ext::precheck_slots()
+struct llama_batch_slot_report {
+    // a duplicate (seq_id, pos) slot combination and the batch indices that compete for it
+    struct conflict {
+        llama_seq_id seq_id;
+        std::array<llama_pos, GGML_MROPE_SECTIONS> pos;
+        std::vector<int32_t> idxs; // batch indices, always size >= 2
+    };
+
+    // a batch index whose slot is out of range (invalid seq_id and/or negative position)
+    struct out_of_range {
+        int32_t      idx;
+        llama_seq_id seq_id;
+        std::array<llama_pos, GGML_MROPE_SECTIONS> pos;
+    };
+
+    std::vector<conflict>     conflicts;
+    std::vector<out_of_range> invalid;
+
+    bool ok() const {
+        return conflicts.empty() && invalid.empty();
+    }
+
+    std::string to_string() const;
+};
+
 // MTP hook batches carry the target model's hidden state (n_embd_out size).
 // DFlash batches carry the fused target features at the encoder input width (n_embd_inp_enc size).
 // Normal batches carry token embeddings (n_embd_inp size).
@@ -114,6 +141,14 @@ struct llama_batch_ext {
             size_t n_pos_per_embd);
 
     void clear();
+
+    // dry-run slot conflict precheck
+    //
+    // scans the batch for duplicate (seq_id, pos) slot combinations and for out-of-range slots
+    // (invalid seq_id, negative position). pure check - does not modify the batch and does not
+    // commit anything to the memory module. called by llama_batch_allocr::init() before the
+    // batch is sanitized; can also be called directly by users to validate a batch in advance.
+    llama_batch_slot_report precheck_slots() const;
 
     // add an entry with an undefined position
     // the caller must set it explicitly via set_token_pos()

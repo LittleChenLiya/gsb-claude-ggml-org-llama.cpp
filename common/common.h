@@ -255,6 +255,11 @@ struct common_params_sampling {
     bool    no_perf            = false;  // disable performance metrics
     bool    timing_per_token   = false;
 
+    // enable optional rejection-reason tracking in common_sampler
+    // when enabled, the sampler records which constraint (top-k, logit-bias, grammar, ...)
+    // filtered each candidate token. the sampling result is unaffected.
+    bool    track_rejections   = false;
+
     uint64_t user_sampling_config = 0; // bitfield to track user-specified samplers
 
     std::vector<std::string> dry_sequence_breakers = {"\n", ":", "\"", "*"};     // default sequence breakers for DRY

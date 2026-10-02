@@ -1183,6 +1183,12 @@ static void llama_sampler_dist_apply(struct llama_sampler * smpl, llama_token_da
         sum_cum += p;
     }
 
+    // if all logits are -INFINITY, sum_cum is NaN and no valid candidate exists
+    if (std::isnan(sum_cum)) {
+        cur_p->selected = -1;
+        return;
+    }
+
 #if 1
     // sample from the obtained probabilities and normalize the probs in a single pass
     // this is ~3x faster on Mac with full gpt-oss vocab than the version below

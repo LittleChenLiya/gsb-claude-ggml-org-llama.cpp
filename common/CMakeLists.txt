@@ -141,6 +141,11 @@ if (LLAMA_SUBPROCESS)
     target_compile_definitions(${TARGET} PUBLIC LLAMA_SUBPROCESS)
 endif()
 
+# cpp-httplib requires Windows 10+ (_WIN32_WINNT >= 0x0A00)
+if (WIN32)
+    target_compile_definitions(${TARGET} PRIVATE _WIN32_WINNT=0x0A00)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

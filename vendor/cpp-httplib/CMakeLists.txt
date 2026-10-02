@@ -35,6 +35,8 @@ target_compile_definitions(${TARGET} PRIVATE
     CPPHTTPLIB_REQUEST_URI_MAX_LENGTH=32768
     # disable Nagle's algorithm
     CPPHTTPLIB_TCP_NODELAY=1
+    # require Windows 10+ for CreateFile2 etc.
+    _WIN32_WINNT=0x0A00
 )
 
 set(OPENSSL_NO_ASM ON CACHE BOOL "Disable OpenSSL ASM code when building BoringSSL or LibreSSL")

@@ -90,6 +90,34 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
+// rejection reason tracking
+//
+// when tracking is enabled (via params.track_rejections or common_sampler_set_track_rejections),
+// the sampler records which constraint filtered each candidate token during the last sample() call.
+// the tracking is purely observational: it does not alter the sampling result or the probability
+// normalization. when tracking is disabled, the sampling path is identical to the original behavior.
+
+struct common_sampler_rejection {
+    llama_token token;  // the candidate token that was rejected
+    std::string reason; // name of the constraint that rejected it (e.g. "top-k", "logit-bias", "grammar")
+};
+
+// enable or disable rejection reason tracking
+void common_sampler_set_track_rejections(struct common_sampler * gsmpl, bool enable);
+
+// returns true if rejection reason tracking is enabled
+bool common_sampler_get_track_rejections(const struct common_sampler * gsmpl);
+
+// get the rejection reasons recorded during the last sample() call
+// the returned vector is sorted by token id for convenience
+std::vector<common_sampler_rejection> common_sampler_get_rejections(const struct common_sampler * gsmpl);
+
+// returns true if the last sample() call had no valid candidates (all tokens rejected)
+bool common_sampler_get_empty_candidates(const struct common_sampler * gsmpl);
+
+// clear the recorded rejection reasons
+void common_sampler_clear_rejections(struct common_sampler * gsmpl);
+
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 

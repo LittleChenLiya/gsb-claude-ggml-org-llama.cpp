@@ -94,6 +94,7 @@ value identifier::execute_impl(context & ctx) const {
         return mk_val<value_func>(val, builtins.at(val));
     } else {
         JJ_DEBUG("Identifier '%s' not found, returning undefined", val.c_str());
+        ctx.note_undefined_identifier(val);
         return mk_val<value_undefined>(val);
     }
 }
@@ -374,7 +375,26 @@ static value apply_filter(context & ctx, const statement_ptr & filter, value inp
 }
 
 value filter_expression::execute_impl(context & ctx) const {
-    return apply_filter(ctx, filter, operand->execute(ctx));
+    // The "default" filter explicitly handles a missing value, so do not report its
+    // operand as an unconsumed placeholder.
+    bool is_default_filter = false;
+    if (is_stmt<identifier>(filter)) {
+        const std::string & filter_id = cast_stmt<identifier>(filter)->val;
+        is_default_filter = (filter_id == "default" || filter_id == "d");
+    } else if (is_stmt<call_expression>(filter)) {
+        const auto & call = cast_stmt<call_expression>(filter);
+        if (is_stmt<identifier>(call->callee)) {
+            const std::string & filter_id = cast_stmt<identifier>(call->callee)->val;
+            is_default_filter = (filter_id == "default" || filter_id == "d");
+        }
+    }
+
+    value input;
+    {
+        context::scoped_undefined_tracking_suppress guard(ctx, is_default_filter);
+        input = operand->execute(ctx);
+    }
+    return apply_filter(ctx, filter, std::move(input));
 }
 
 value filter_statement::execute_impl(context & ctx) const {
@@ -392,11 +412,6 @@ value test_expression::execute_impl(context & ctx) const {
     const auto & builtins = global_builtins();
 
     std::string test_id;
-    value input = operand->execute(ctx);
-
-    func_args args(ctx);
-    args.push_back(input);
-
     if (is_stmt<identifier>(test)) {
         test_id = cast_stmt<identifier>(test)->val;
     } else if (is_stmt<call_expression>(test)) {
@@ -405,14 +420,28 @@ value test_expression::execute_impl(context & ctx) const {
             throw std::runtime_error("Test callee must be an identifier");
         }
         test_id = cast_stmt<identifier>(call->callee)->val;
+    } else {
+        throw std::runtime_error("Invalid test expression");
+    }
 
+    // "is defined" / "is undefined" explicitly handle a missing value, so do not
+    // report the operand as an unconsumed placeholder.
+    const bool is_defined_test = (test_id == "defined" || test_id == "undefined");
+    value input;
+    {
+        context::scoped_undefined_tracking_suppress guard(ctx, is_defined_test);
+        input = operand->execute(ctx);
+    }
+
+    func_args args(ctx);
+    args.push_back(input);
+
+    if (is_stmt<call_expression>(test)) {
+        auto call = cast_stmt<call_expression>(test);
         JJ_DEBUG("Applying test '%s' with arguments to %s", test_id.c_str(), input->type().c_str());
         for (const auto & arg_expr : call->args) {
             args.push_back(arg_expr->execute(ctx));
         }
-
-    } else {
-        throw std::runtime_error("Invalid test expression");
     }
 
     const std::string test_name = "test_is_" + test_id;

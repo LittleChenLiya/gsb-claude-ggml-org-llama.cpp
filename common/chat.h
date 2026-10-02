@@ -368,7 +368,8 @@ std::map<std::string, bool> common_chat_templates_get_caps(const common_chat_tem
 
 std::string common_chat_template_direct_apply(
     const common_chat_template & tmpl,
-    const autoparser::generation_params & inputs);
+    const autoparser::generation_params & inputs,
+    std::vector<std::string> * unconsumed_placeholders = nullptr);
 
 std::string common_chat_template_generation_prompt(
     const common_chat_template &          tmpl,

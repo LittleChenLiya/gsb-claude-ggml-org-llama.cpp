@@ -907,7 +907,8 @@ std::string common_chat_template_direct_apply_impl(
     const autoparser::generation_params & inputs,
     const std::optional<json> & messages_override,
     const std::optional<json> & tools_override,
-    const std::optional<json> & additional_context) {
+    const std::optional<json> & additional_context,
+    std::vector<std::string> * unconsumed_placeholders) {
     jinja::context ctx(tmpl.source());
 
     // messages_override is already built for this template, do not touch its content parts
@@ -948,12 +949,23 @@ std::string common_chat_template_direct_apply_impl(
 
     jinja::global_from_json(ctx, inp, inputs.mark_input);
 
+    // Track placeholders the template references but the caller never provides.
+    // This only observes the execution; it does not affect the rendered text.
+    ctx.track_undefined = true;
+
     // render
     jinja::runtime runtime(ctx);
     const jinja::value results = runtime.execute(tmpl.prog);
     auto parts = jinja::runtime::gather_string_parts(results);
 
     std::string result = parts->as_string().str();
+
+    if (unconsumed_placeholders) {
+        unconsumed_placeholders->clear();
+        if (ctx.undefined_idents) {
+            unconsumed_placeholders->assign(ctx.undefined_idents->begin(), ctx.undefined_idents->end());
+        }
+    }
 
     // TODO: improve this later
     if (inputs.add_bos && string_starts_with(result, tmpl.bos_token())) {
@@ -967,8 +979,10 @@ std::string common_chat_template_direct_apply_impl(
 
 std::string common_chat_template_direct_apply(
     const common_chat_template & tmpl,
-    const autoparser::generation_params & inputs) {
-    return common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt);
+    const autoparser::generation_params & inputs,
+    std::vector<std::string> * unconsumed_placeholders) {
+    return common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt,
+                                                  unconsumed_placeholders);
 }
 
 std::string common_chat_template_generation_prompt_impl(

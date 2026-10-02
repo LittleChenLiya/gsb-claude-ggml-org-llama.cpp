@@ -6,6 +6,7 @@
 #include <cassert>
 #include <ctime>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -58,6 +59,20 @@ struct context {
 
     bool is_get_stats = false; // whether to collect stats
 
+    // When enabled, identifiers that resolve to an undefined value during execution
+    // are recorded in undefined_idents. This is used to produce a diagnostic list of
+    // placeholders that the template referenced but the caller never provided.
+    bool track_undefined = false;
+
+    // RAII-managed flag: while true, identifier lookups that resolve to undefined are
+    // not recorded. Used for operands of "is defined"/"is undefined" tests and the
+    // "default" filter, which explicitly handle a missing value.
+    bool suppress_undefined_tracking = false;
+
+    // Shared across scopes (context copies) so identifiers recorded inside loops or
+    // other nested scopes are still reported after the whole program has run.
+    std::shared_ptr<std::set<std::string>> undefined_idents;
+
     visitor_fn visitor;
 
     // src is optional, used for error reporting
@@ -70,6 +85,7 @@ struct context {
         env->insert("False", mk_val<value_bool>(false));
         env->insert("none",  mk_val<value_none>());
         env->insert("None",  mk_val<value_none>());
+        undefined_idents = std::make_shared<std::set<std::string>>();
         current_time = std::time(nullptr);
     }
     ~context() = default;
@@ -82,8 +98,30 @@ struct context {
         }
         current_time = parent.current_time;
         is_get_stats = parent.is_get_stats;
+        track_undefined = parent.track_undefined;
+        suppress_undefined_tracking = parent.suppress_undefined_tracking;
+        undefined_idents = parent.undefined_idents;
         src = parent.src;
     }
+
+    // Record an identifier that resolved to an undefined value, unless tracking is
+    // disabled or the current scope explicitly handles undefined values.
+    void note_undefined_identifier(const std::string & name) {
+        if (track_undefined && !suppress_undefined_tracking && undefined_idents) {
+            undefined_idents->insert(name);
+        }
+    }
+
+    // RAII guard that suppresses unconsumed-placeholder tracking for the current scope.
+    struct scoped_undefined_tracking_suppress {
+        context & c;
+        bool     prev;
+        explicit scoped_undefined_tracking_suppress(context & c, bool suppress = true)
+            : c(c), prev(c.suppress_undefined_tracking) {
+            c.suppress_undefined_tracking = prev || suppress;
+        }
+        ~scoped_undefined_tracking_suppress() { c.suppress_undefined_tracking = prev; }
+    };
 
     value get_val(const std::string & name) {
         value default_val = mk_val<value_undefined>(name);

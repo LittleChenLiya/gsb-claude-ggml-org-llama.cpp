@@ -115,6 +115,10 @@ struct llama_context {
 
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
+    // get read-only statistics about the last cancelled (aborted) decode/encode round
+    // returns false and zero-initializes `stats` if the last round was not cancelled
+    bool get_cancel_stats(llama_cancel_stats & stats) const;
+
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
@@ -145,6 +149,13 @@ struct llama_context {
 
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
+
+private:
+    // record statistics for a cancelled (aborted) round, release its temporary batch
+    // and reset the output state so that the next round does not observe stale data
+    void cancel_round(uint32_t n_tokens_total, uint32_t n_tokens_done, uint32_t n_ubatch_done);
+
+public:
 
     // compat version
     int encode(const llama_batch & batch_inp);
@@ -404,4 +415,8 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // statistics of the last cancelled (aborted) decode/encode round
+    llama_cancel_stats cancel_stats = {};
+    bool cancel_stats_valid = false;
 };

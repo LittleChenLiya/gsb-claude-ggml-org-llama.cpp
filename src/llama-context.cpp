@@ -1474,6 +1474,10 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         return -1;
     }
 
+    // a new round invalidates the statistics of any previously cancelled round
+    cancel_stats       = {};
+    cancel_stats_valid = false;
+
     const auto & hparams = model.hparams;
 
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != hparams.n_embd_inp_enc()) {
@@ -1541,7 +1545,12 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
 
     if (!res) {
         switch (status) {
-            case GGML_STATUS_ABORTED:      return  2;
+            case GGML_STATUS_ABORTED:
+                {
+                    // the encoder processes the batch in a single shot, so no tokens were completed
+                    cancel_round(n_tokens, 0, 0);
+                    return 2;
+                }
             case GGML_STATUS_ALLOC_FAILED: return -2;
             case GGML_STATUS_FAILED:       return -3;
             case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
@@ -1707,6 +1716,41 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+void llama_context::cancel_round(uint32_t n_tokens_total, uint32_t n_tokens_done, uint32_t n_ubatch_done) {
+    GGML_ASSERT(n_tokens_done <= n_tokens_total);
+
+    // record read-only statistics about the cancelled round
+    cancel_stats.n_tokens_total = n_tokens_total;
+    cancel_stats.n_tokens_done  = n_tokens_done;
+    cancel_stats.n_tokens_left  = n_tokens_total - n_tokens_done;
+    cancel_stats.n_ubatch_done  = n_ubatch_done;
+    cancel_stats.n_batch_bytes  = balloc->get_bytes();
+    cancel_stats_valid = true;
+
+    LLAMA_LOG_WARN("%s: round cancelled with %u/%u tokens processed (%u left), releasing %zu bytes of temporary batch storage\n",
+            __func__, n_tokens_done, n_tokens_total, n_tokens_total - n_tokens_done, cancel_stats.n_batch_bytes);
+
+    // release the temporary batch of this round
+    balloc->release();
+
+    // reset the output state so that the next round does not observe stale data
+    // sync first so any in-flight async copies into embd_seq complete before it is freed
+    if (!embd_seq.empty()) {
+        synchronize();
+    }
+    embd_seq.clear();
+
+    n_outputs = 0;
+    std::fill(output_ids.begin(), output_ids.end(), -1);
+    output_swaps.clear();
+}
+
+bool llama_context::get_cancel_stats(llama_cancel_stats & stats) const {
+    stats = cancel_stats_valid ? cancel_stats : llama_cancel_stats{};
+
+    return cancel_stats_valid;
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -1717,6 +1761,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
+
+    // a new round invalidates the statistics of any previously cancelled round
+    cancel_stats       = {};
+    cancel_stats_valid = false;
 
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
@@ -1864,6 +1912,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    uint32_t n_ubatch_done = 0;
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -1911,7 +1961,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
 
             switch (status) {
-                case GGML_STATUS_ABORTED:      return  2;
+                case GGML_STATUS_ABORTED:
+                    {
+                        cancel_round(n_tokens_all, n_tokens_prev, n_ubatch_done);
+                        return 2;
+                    }
                 case GGML_STATUS_ALLOC_FAILED: return -2;
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
@@ -2039,6 +2093,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+        n_ubatch_done  += 1;
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -3928,6 +3983,14 @@ int32_t llama_n_threads_batch(llama_context * ctx) {
 
 void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void * data), void * abort_callback_data) {
     ctx->set_abort_callback(abort_callback, abort_callback_data);
+}
+
+bool llama_get_cancel_stats(const llama_context * ctx, llama_cancel_stats * stats) {
+    if (ctx == nullptr || stats == nullptr) {
+        return false;
+    }
+
+    return ctx->get_cancel_stats(*stats);
 }
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {

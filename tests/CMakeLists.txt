@@ -244,6 +244,16 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_REQUIRED generate-models
     )
 
+    llama_build(test-decode-cancel.cpp)
+    llama_test(
+        test-decode-cancel
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen35-dense.gguf"
+    )
+    set_tests_properties(test-decode-cancel PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
     # Test state save/load functionality across all architectures, using the generated dummy models
     llama_test(
         test-save-load-state

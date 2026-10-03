@@ -1121,6 +1121,24 @@ extern "C" {
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 
+    // Read-only statistics about a cancelled (aborted) llama_decode()/llama_encode() round
+    struct llama_cancel_stats {
+        uint32_t n_tokens_total; // tokens scheduled for the cancelled round
+        uint32_t n_tokens_done;  // tokens fully processed before the cancellation
+        uint32_t n_tokens_left;  // remaining tokens that were not processed
+        uint32_t n_ubatch_done;  // micro-batches fully processed before the cancellation
+        size_t   n_batch_bytes;  // bytes of temporary per-round batch storage released upon cancellation
+    };
+
+    // Get read-only statistics about the last cancelled llama_decode()/llama_encode() round.
+    // A round is "cancelled" when llama_decode()/llama_encode() returns 2 (aborted via the abort callback).
+    // Cancelling a round releases its temporary batch and resets the output state of the context,
+    //   so the context can be reused for subsequent decode/encode calls without observing stale state.
+    // Returns true and fills `stats` when the last round was cancelled.
+    // Returns false and zero-initializes `stats` otherwise (no round yet, or the last round completed/failed).
+    // The returned statistics are a snapshot and remain valid until the next llama_decode()/llama_encode() call.
+    LLAMA_API bool llama_get_cancel_stats(const struct llama_context * ctx, struct llama_cancel_stats * stats);
+
     // Wait until all computations are finished
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases

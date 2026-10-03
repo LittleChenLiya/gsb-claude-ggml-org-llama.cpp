@@ -781,6 +781,52 @@ void llama_batch_allocr::clear() {
     std::fill(seq_idx.begin(), seq_idx.end(), -1);
 }
 
+size_t llama_batch_allocr::get_bytes() const {
+    size_t res = 0;
+
+    res += token_vec  .capacity()*sizeof(decltype(token_vec)  ::value_type);
+    res += embd_vec   .capacity()*sizeof(decltype(embd_vec)   ::value_type);
+    res += seq_id_data.capacity()*sizeof(decltype(seq_id_data)::value_type);
+    res += pos        .capacity()*sizeof(decltype(pos)        ::value_type);
+    res += n_seq_id   .capacity()*sizeof(decltype(n_seq_id)   ::value_type);
+    res += seq_id     .capacity()*sizeof(decltype(seq_id)     ::value_type);
+    res += seq_id_unq .capacity()*sizeof(decltype(seq_id_unq) ::value_type);
+    res += seq_idx    .capacity()*sizeof(decltype(seq_idx)    ::value_type);
+    res += output     .capacity()*sizeof(decltype(output)     ::value_type);
+    res += seq_pos    .capacity()*sizeof(decltype(seq_pos)    ::value_type);
+    res += seq_cpl    .capacity()*sizeof(decltype(seq_cpl)    ::value_type);
+    res += seq_set    .capacity()*sizeof(decltype(seq_set)    ::value_type);
+    res += out_ids    .capacity()*sizeof(decltype(out_ids)    ::value_type);
+    res += used       .capacity()*sizeof(bool);
+
+    return res;
+}
+
+void llama_batch_allocr::release() {
+    clear();
+
+    out_ids.clear();
+    used   .clear();
+
+    // actually free the temporary storage instead of keeping it around for the next round
+    token_vec  .shrink_to_fit();
+    embd_vec   .shrink_to_fit();
+    seq_id_data.shrink_to_fit();
+    pos        .shrink_to_fit();
+    n_seq_id   .shrink_to_fit();
+    seq_id     .shrink_to_fit();
+    seq_id_unq .shrink_to_fit();
+    seq_idx    .shrink_to_fit();
+    output     .shrink_to_fit();
+    seq_pos    .shrink_to_fit();
+    seq_cpl    .shrink_to_fit();
+    seq_set    .shrink_to_fit();
+    out_ids    .shrink_to_fit();
+    used       .shrink_to_fit();
+
+    seq_set_map = {};
+}
+
 llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs) {
     const uint32_t n_tokens = idxs.size();
 

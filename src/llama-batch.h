@@ -153,6 +153,13 @@ public:
     // call once before splitting the batch to reset the internal state
     void split_reset();
 
+    // estimate of the host memory (bytes) currently held by the temporary batch storage
+    size_t get_bytes() const;
+
+    // release the temporary batch storage, e.g. when a decode/encode round is cancelled
+    // the storage is re-allocated on the next init()
+    void release();
+
     // simple split, unknown number of sequence sets of unequal lengths
     llama_ubatch split_simple(uint32_t n_ubatch);
 

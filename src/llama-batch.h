@@ -137,6 +137,11 @@ public:
             const llama_vocab & vocab,
             bool output_all);
 
+    // pre-check a batch for slot conflicts without committing any tokens
+    // returns a list of duplicate (seq_id, pos) combinations and out-of-bounds slots
+    // this is a const, dry-run validation: it does not mutate the batch or the allocr
+    std::vector<llama_batch_slot_conflict> check_slots(const llama_batch_ext & batch_inp) const;
+
     const llama_batch & get_batch() const;
 
     uint32_t get_n_tokens()  const;

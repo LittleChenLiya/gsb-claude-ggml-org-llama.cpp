@@ -1088,6 +1088,40 @@ extern "C" {
                              enum llama_process_type   type,
                               struct llama_batch_ext * batch);
 
+    //
+    // Batch slot conflict pre-check
+    //
+    // A "slot" is a (seq_id, pos) cell in the KV cache. Two tokens that target the
+    // same slot conflict: the second write overwrites the first and the attention
+    // result is wrong. The pre-check below is a const, dry-run validation: it reads
+    // the batch and reports conflicts, but does not mutate the batch or advance any
+    // state (no tokens are committed).
+    //
+
+    enum llama_batch_slot_conflict_type {
+        LLAMA_BATCH_SLOT_CONFLICT_DUPLICATE_POS = 0, // two tokens target the same (seq_id, pos) slot
+        LLAMA_BATCH_SLOT_CONFLICT_SEQ_ID_OOB    = 1, // seq_id is outside [0, n_seq_max)
+        LLAMA_BATCH_SLOT_CONFLICT_POS_OOB       = 2, // position is negative
+    };
+
+    // describes a single slot conflict found in a batch
+    struct llama_batch_slot_conflict {
+        enum llama_batch_slot_conflict_type type;
+        llama_seq_id seq_id;        // sequence id of the conflicting slot
+        llama_pos    pos;           // position of the conflicting slot
+        int32_t      token_first;   // batch index of the first token occupying the slot (-1 for OOB)
+        int32_t      token_second;  // batch index of the conflicting token (-1 for OOB)
+    };
+
+    // Pre-check a batch for slot conflicts without committing any tokens.
+    // Returns the total number of conflicts found.
+    // If conflicts is non-null and max_conflicts > 0, up to max_conflicts descriptors
+    // are written to the conflicts array (in batch order).
+    LLAMA_API int32_t llama_batch_ext_check_slots(
+            const struct llama_batch_ext * batch,
+            struct llama_batch_slot_conflict * conflicts,
+            int32_t max_conflicts);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)

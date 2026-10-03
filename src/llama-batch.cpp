@@ -11,6 +11,7 @@
 #include <cstring>
 #include <algorithm>
 #include <sstream>
+#include <map>
 
 llama_batch_allocr::llama_batch_allocr(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {
     const char * LLAMA_BATCH_DEBUG = getenv("LLAMA_BATCH_DEBUG");
@@ -420,6 +421,46 @@ bool llama_batch_allocr::init(
     split_reset();
 
     return true;
+}
+
+std::vector<llama_batch_slot_conflict> llama_batch_allocr::check_slots(const llama_batch_ext & batch_inp) const {
+    std::vector<llama_batch_slot_conflict> conflicts;
+
+    const int32_t n_tok = (int32_t) batch_inp.tokens.size();
+    const llama_seq_id n_seq_max = batch_inp.n_seq_max;
+
+    // track which (seq_id, pos) slots have been seen, and the first token that occupied them
+    std::map<std::pair<llama_seq_id, llama_pos>, int32_t> seen;
+
+    for (int32_t i = 0; i < n_tok; ++i) {
+        const auto & tok = batch_inp.tokens[i];
+
+        for (auto sid : tok.seq_ids) {
+            // check seq_id bounds
+            if (sid < 0 || sid >= n_seq_max) {
+                conflicts.push_back({LLAMA_BATCH_SLOT_CONFLICT_SEQ_ID_OOB, sid, tok.pos[0], -1, -1});
+                continue;
+            }
+
+            // check pos bounds (the KV cache slot is pos[0], the temporal position)
+            const llama_pos p = tok.pos[0];
+            if (p < 0) {
+                conflicts.push_back({LLAMA_BATCH_SLOT_CONFLICT_POS_OOB, sid, p, -1, -1});
+                continue;
+            }
+
+            // check for duplicate (seq_id, pos)
+            auto key = std::make_pair(sid, p);
+            auto it = seen.find(key);
+            if (it == seen.end()) {
+                seen[key] = i;
+            } else {
+                conflicts.push_back({LLAMA_BATCH_SLOT_CONFLICT_DUPLICATE_POS, sid, p, it->second, i});
+            }
+        }
+    }
+
+    return conflicts;
 }
 
 llama_ubatch llama_batch_allocr::ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs) {
@@ -1240,6 +1281,27 @@ bool llama_batch_ext_set_output_embd(llama_batch_ext * batch, int32_t idx, bool 
 
 bool llama_batch_ext_set_output_logits(llama_batch_ext * batch, int32_t idx, bool value) {
     return batch->set_output(idx, value);
+}
+
+int32_t llama_batch_ext_check_slots(
+        const struct llama_batch_ext * batch,
+        struct llama_batch_slot_conflict * conflicts,
+        int32_t max_conflicts) {
+    if (!batch) {
+        return 0;
+    }
+
+    llama_batch_allocr allocr(batch->n_pos_per_embd);
+    const auto report = allocr.check_slots(*batch);
+
+    if (conflicts && max_conflicts > 0) {
+        const int32_t n = std::min((int32_t) report.size(), max_conflicts);
+        for (int32_t i = 0; i < n; ++i) {
+            conflicts[i] = report[i];
+        }
+    }
+
+    return (int32_t) report.size();
 }
 
 // llama_batch_compat

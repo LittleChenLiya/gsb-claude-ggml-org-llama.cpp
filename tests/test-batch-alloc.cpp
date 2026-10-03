@@ -1042,6 +1042,161 @@ static void test_mtp_embd_width(testing & t) {
     });
 }
 
+static void test_slot_conflicts(testing & t) {
+    llama_vocab vocab;
+
+    t.test("valid_batch_has_no_conflicts", [&](testing & t) {
+        batch_builder bb;
+        bb.add(0, {0}, false);
+        bb.add(1, {0}, false);
+        bb.add(2, {0}, true);
+
+        llama_batch_allocr ba(1);
+        const auto report = ba.check_slots(bb.b);
+        t.assert_true("no conflicts in a valid batch", report.empty());
+
+        // the batch is unchanged after the dry-run pre-check (no tokens committed)
+        t.assert_equal((size_t) 3, bb.b.tokens.size());
+        t.assert_equal(0, bb.b.tokens[0].pos[0]);
+        t.assert_equal(2, bb.b.tokens[2].pos[0]);
+    });
+
+    t.test("duplicate_pos_in_same_seq", [&](testing & t) {
+        batch_builder bb;
+        bb.add(0, {0}, false);
+        bb.add(1, {0}, false);
+        bb.add(1, {0}, true); // duplicate (seq 0, pos 1)
+
+        llama_batch_allocr ba(1);
+        const auto report = ba.check_slots(bb.b);
+        t.assert_equal((size_t) 1, report.size());
+        t.assert_equal((int) LLAMA_BATCH_SLOT_CONFLICT_DUPLICATE_POS, (int) report[0].type);
+        t.assert_equal(0, report[0].seq_id);
+        t.assert_equal(1, report[0].pos);
+        t.assert_equal(1, report[0].token_first);
+        t.assert_equal(2, report[0].token_second);
+    });
+
+    t.test("same_pos_on_different_seqs_is_fine", [&](testing & t) {
+        batch_builder bb;
+        bb.add(0, {0}, false);
+        bb.add(0, {1}, false); // different seq, same pos -> no conflict
+        bb.add(1, {0}, false);
+        bb.add(1, {1}, true);
+
+        llama_batch_allocr ba(1);
+        const auto report = ba.check_slots(bb.b);
+        t.assert_true("same pos on different seqs is fine", report.empty());
+    });
+
+    t.test("duplicate_pos_with_coupled_seqs", [&](testing & t) {
+        batch_builder bb;
+        bb.add(0, {0, 1}, false); // token 0: seq 0 and 1 at pos 0
+        bb.add(0, {0}, false);     // token 1: seq 0 at pos 0 -> conflict with token 0
+
+        llama_batch_allocr ba(1);
+        const auto report = ba.check_slots(bb.b);
+        t.assert_equal((size_t) 1, report.size());
+        t.assert_equal((int) LLAMA_BATCH_SLOT_CONFLICT_DUPLICATE_POS, (int) report[0].type);
+        t.assert_equal(0, report[0].seq_id);
+        t.assert_equal(0, report[0].pos);
+        t.assert_equal(0, report[0].token_first);
+        t.assert_equal(1, report[0].token_second);
+    });
+
+    t.test("seq_id_out_of_bounds", [&](testing & t) {
+        batch_builder bb;
+        const int32_t idx = bb.add(0, {0}, true);
+        bb.b.tokens[idx].seq_ids = { 4 }; // n_seq_max = 4, so 4 is out of bounds
+
+        llama_batch_allocr ba(1);
+        const auto report = ba.check_slots(bb.b);
+        t.assert_equal((size_t) 1, report.size());
+        t.assert_equal((int) LLAMA_BATCH_SLOT_CONFLICT_SEQ_ID_OOB, (int) report[0].type);
+        t.assert_equal(4, report[0].seq_id);
+        t.assert_equal(-1, report[0].token_first);
+        t.assert_equal(-1, report[0].token_second);
+    });
+
+    t.test("negative_seq_id", [&](testing & t) {
+        batch_builder bb;
+        const int32_t idx = bb.add(0, {0}, true);
+        bb.b.tokens[idx].seq_ids = { -1 };
+
+        llama_batch_allocr ba(1);
+        const auto report = ba.check_slots(bb.b);
+        t.assert_equal((size_t) 1, report.size());
+        t.assert_equal((int) LLAMA_BATCH_SLOT_CONFLICT_SEQ_ID_OOB, (int) report[0].type);
+        t.assert_equal(-1, report[0].seq_id);
+    });
+
+    t.test("negative_pos", [&](testing & t) {
+        batch_builder bb;
+        const int32_t idx = bb.add(0, {0}, true);
+        bb.b.tokens[idx].pos[0] = -1;
+
+        llama_batch_allocr ba(1);
+        const auto report = ba.check_slots(bb.b);
+        t.assert_equal((size_t) 1, report.size());
+        t.assert_equal((int) LLAMA_BATCH_SLOT_CONFLICT_POS_OOB, (int) report[0].type);
+        t.assert_equal(0, report[0].seq_id);
+        t.assert_equal(-1, report[0].pos);
+    });
+
+    t.test("multiple_conflicts_reported_in_order", [&](testing & t) {
+        batch_builder bb;
+        bb.add(0, {0}, false);
+        bb.add(0, {0}, false); // duplicate (0, 0)
+        bb.add(1, {0}, false);
+        bb.add(1, {0}, true);  // duplicate (0, 1)
+
+        llama_batch_allocr ba(1);
+        const auto report = ba.check_slots(bb.b);
+        t.assert_equal((size_t) 2, report.size());
+        t.assert_equal(0, report[0].seq_id);
+        t.assert_equal(0, report[0].pos);
+        t.assert_equal(0, report[0].token_first);
+        t.assert_equal(1, report[0].token_second);
+        t.assert_equal(0, report[1].seq_id);
+        t.assert_equal(1, report[1].pos);
+        t.assert_equal(2, report[1].token_first);
+        t.assert_equal(3, report[1].token_second);
+    });
+
+    t.test("c_api_check_slots", [&](testing & t) {
+        batch_builder bb;
+        bb.add(0, {0}, false);
+        bb.add(0, {0}, false); // duplicate (0, 0)
+        bb.add(1, {0}, true);
+
+        struct llama_batch_slot_conflict conflicts[8];
+        const int32_t n = llama_batch_ext_check_slots(&bb.b, conflicts, 8);
+        t.assert_equal(1, n);
+        t.assert_equal((int) LLAMA_BATCH_SLOT_CONFLICT_DUPLICATE_POS, (int) conflicts[0].type);
+        t.assert_equal(0, conflicts[0].seq_id);
+        t.assert_equal(0, conflicts[0].pos);
+        t.assert_equal(0, conflicts[0].token_first);
+        t.assert_equal(1, conflicts[0].token_second);
+
+        // null batch -> 0 conflicts
+        t.assert_equal(0, llama_batch_ext_check_slots(nullptr, nullptr, 0));
+    });
+
+    t.test("c_api_limits_reported_conflicts", [&](testing & t) {
+        batch_builder bb;
+        bb.add(0, {0}, false);
+        bb.add(0, {0}, false); // duplicate (0, 0)
+        bb.add(1, {0}, false);
+        bb.add(1, {0}, true);  // duplicate (0, 1)
+
+        struct llama_batch_slot_conflict conflicts[1];
+        const int32_t n = llama_batch_ext_check_slots(&bb.b, conflicts, 1);
+        t.assert_equal(2, n); // total count is 2
+        t.assert_equal((int) LLAMA_BATCH_SLOT_CONFLICT_DUPLICATE_POS, (int) conflicts[0].type);
+        t.assert_equal(0, conflicts[0].pos); // only the first is written
+    });
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -1064,6 +1219,7 @@ int main(int argc, char ** argv) {
     t.test("keep_tail",      test_keep_tail);
     t.test("mrope",          test_mrope);
     t.test("mtp_embd_width", test_mtp_embd_width);
+    t.test("slot_conflicts", test_slot_conflicts);
 
     return t.summary();
 }

@@ -1768,6 +1768,25 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -1;
     }
 
+    // advisory slot conflict pre-check: logs warnings but does not change the decode path
+    const auto slot_conflicts = balloc->check_slots(batch_inp);
+    for (const auto & c : slot_conflicts) {
+        switch (c.type) {
+            case LLAMA_BATCH_SLOT_CONFLICT_DUPLICATE_POS:
+                LLAMA_LOG_WARN("%s: slot conflict: seq_id %d pos %d targeted by tokens %d and %d\n",
+                        __func__, c.seq_id, c.pos, c.token_first, c.token_second);
+                break;
+            case LLAMA_BATCH_SLOT_CONFLICT_SEQ_ID_OOB:
+                LLAMA_LOG_WARN("%s: slot conflict: seq_id %d is out of bounds [0, %d)\n",
+                        __func__, c.seq_id, batch_inp.n_seq_max);
+                break;
+            case LLAMA_BATCH_SLOT_CONFLICT_POS_OOB:
+                LLAMA_LOG_WARN("%s: slot conflict: pos %d is negative (seq_id %d)\n",
+                        __func__, c.pos, c.seq_id);
+                break;
+        }
+    }
+
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 

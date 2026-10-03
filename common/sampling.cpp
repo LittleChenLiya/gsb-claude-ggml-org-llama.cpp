@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // the ring buffer works similarly to std::deque, but with a fixed capacity
@@ -121,8 +122,26 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // rejection reason tracking (disabled by default)
+    // when enabled, rejections is populated during common_sampler_sample
+    bool track_rejections = false;
+
+    std::vector<common_sampler_rejection> rejections;
+
+    // apply a sampler, recording the rejected candidates when tracking is enabled
+    // note: with tracking disabled this is exactly llama_sampler_apply
+    void apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+        if (track_rejections) {
+            common_sampler_apply_tracked(smpl, cur_p, rejections);
+        } else {
+            llama_sampler_apply(smpl, cur_p);
+        }
+    }
+
     void reset() {
         prev.clear();
+
+        rejections.clear();
 
         llama_sampler_reset(chain);
     }
@@ -159,6 +178,10 @@ struct common_sampler {
         }
 
         cur_p = { cur.data(), cur.size(), -1, false };
+
+        // a new set of candidates - the rejections reported below will correspond
+        // to the pass that produces the final token (also on the resample path)
+        rejections.clear();
     }
 
     common_time_meas tm() {
@@ -507,7 +530,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    auto * result = new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
@@ -516,6 +539,11 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
     };
+
+    result->track_rejections = gsmpl->track_rejections;
+    result->rejections       = gsmpl->rejections;
+
+    return result;
 }
 
 void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
@@ -536,6 +564,9 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->t_total_us = src->t_total_us;
+
+    dst->track_rejections = src->track_rejections;
+    dst->rejections       = src->rejections;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -629,13 +660,19 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     }
 
     // apply reasoning budget first
-    llama_sampler_apply(rbudget, &cur_p);
+    gsmpl->apply(rbudget, &cur_p);
 
     if (grammar_first && grammar_should_apply(gsmpl)) {
-        llama_sampler_apply(grmr, &cur_p);
+        gsmpl->apply(grmr, &cur_p);
     }
 
-    llama_sampler_apply(chain, &cur_p);
+    gsmpl->apply(chain, &cur_p);
+
+    if (cur_p.selected < 0) {
+        // no token was selected - the candidate set was empty
+        LOG_ERR("%s: no candidates to sample from - check your sampling configuration\n", __func__);
+        return LLAMA_TOKEN_NULL;
+    }
 
     id = cur_p.data[cur_p.selected].id;
 
@@ -660,13 +697,13 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
     gsmpl->set_logits(ctx, idx);
 
-    llama_sampler_apply(rbudget,  &cur_p);
+    gsmpl->apply(rbudget, &cur_p);
 
     if (grammar_should_apply(gsmpl)) {
-        llama_sampler_apply(grmr,  &cur_p);
+        gsmpl->apply(grmr, &cur_p);
     }
 
-    llama_sampler_apply(chain, &cur_p);
+    gsmpl->apply(chain, &cur_p);
 
     GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
 
@@ -716,6 +753,92 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
+}
+
+// rejection reason tracking
+
+void common_sampler_set_rejection_tracking(struct common_sampler * gsmpl, bool enabled) {
+    if (!gsmpl) {
+        return;
+    }
+
+    gsmpl->track_rejections = enabled;
+
+    if (!enabled) {
+        gsmpl->rejections.clear();
+    }
+}
+
+bool common_sampler_get_rejection_tracking(const struct common_sampler * gsmpl) {
+    return gsmpl && gsmpl->track_rejections;
+}
+
+const std::vector<common_sampler_rejection> & common_sampler_get_rejections(const struct common_sampler * gsmpl) {
+    static const std::vector<common_sampler_rejection> empty;
+
+    return gsmpl ? gsmpl->rejections : empty;
+}
+
+// apply a single sampler and record which live candidates it rejected
+static void common_sampler_apply_one_tracked(struct llama_sampler * smpl, llama_token_data_array * cur_p, std::vector<common_sampler_rejection> & out) {
+    // snapshot the live candidates
+    std::unordered_set<llama_token> live;
+    live.reserve(cur_p->size);
+    for (size_t i = 0; i < cur_p->size; i++) {
+        if (cur_p->data[i].logit != -INFINITY) {
+            live.insert(cur_p->data[i].id);
+        }
+    }
+
+    llama_sampler_apply(smpl, cur_p);
+
+    if (live.empty()) {
+        return;
+    }
+
+    const std::string reason = llama_sampler_name(smpl);
+
+    // tokens still present in the array are rejected if their logit became -INFINITY
+    for (size_t i = 0; i < cur_p->size; i++) {
+        auto it = live.find(cur_p->data[i].id);
+        if (it == live.end()) {
+            continue;
+        }
+        if (cur_p->data[i].logit == -INFINITY) {
+            out.push_back({cur_p->data[i].id, reason});
+        }
+        live.erase(it);
+    }
+
+    // tokens no longer present in the array were removed by this sampler (e.g. top-k)
+    for (const auto & id : live) {
+        out.push_back({id, reason});
+    }
+}
+
+void common_sampler_apply_tracked(struct llama_sampler * smpl, llama_token_data_array * cur_p, std::vector<common_sampler_rejection> & out) {
+    if (!smpl) {
+        return;
+    }
+
+    // if this is a chain, track each sub-sampler individually
+    // note: llama_sampler_chain_get(smpl, -1) returns smpl itself iff smpl is a chain
+    if (llama_sampler_chain_get(smpl, -1) == smpl) {
+        const int32_t n = llama_sampler_chain_n(smpl);
+        for (int32_t i = 0; i < n; i++) {
+            auto * sub = llama_sampler_chain_get(smpl, i);
+
+            // mirror llama_sampler_chain_apply: skip samplers without an apply callback
+            if (!sub || !sub->iface->apply) {
+                continue;
+            }
+
+            common_sampler_apply_one_tracked(sub, cur_p, out);
+        }
+        return;
+    }
+
+    common_sampler_apply_one_tracked(smpl, cur_p, out);
 }
 
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {

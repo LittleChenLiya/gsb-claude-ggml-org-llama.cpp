@@ -90,6 +90,43 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
+// rejection reason tracking (optional, disabled by default)
+//
+// when enabled, common_sampler_sample records which constraint (sampler)
+// rejected each candidate token during the last sampling call.
+//
+// the tracking is observational only: the same samplers are applied in the
+// same order, so the sampled token and the probability normalization are
+// identical whether the tracking is enabled or not.
+
+struct common_sampler_rejection {
+    llama_token token;     // the rejected token
+    std::string reason;    // name of the sampler that rejected it (e.g. "top-k", "logit-bias", "grammar")
+};
+
+// enable/disable the rejection reason tracking (default: disabled)
+void common_sampler_set_rejection_tracking(struct common_sampler * gsmpl, bool enabled);
+
+// returns true if the rejection reason tracking is enabled
+bool common_sampler_get_rejection_tracking(const struct common_sampler * gsmpl);
+
+// rejections recorded during the last common_sampler_sample call
+// empty when the tracking is disabled
+const std::vector<common_sampler_rejection> & common_sampler_get_rejections(const struct common_sampler * gsmpl);
+
+// helper: apply a sampler (or a sampler chain) to cur_p while recording which
+// sampler rejected each candidate token.
+//
+// applying the samplers of a chain one-by-one is equivalent to
+// llama_sampler_apply on the whole chain, so the resulting cur_p (selected
+// token and normalized probabilities) is identical to a non-tracked apply.
+//
+// a token is considered "rejected" by a sampler when it was a live candidate
+// (logit != -INFINITY) before the sampler was applied and afterwards either:
+//   - its logit was set to -INFINITY (e.g. logit-bias, grammar), or
+//   - it was removed from the candidate array entirely (e.g. top-k)
+void common_sampler_apply_tracked(struct llama_sampler * smpl, llama_token_data_array * cur_p, std::vector<common_sampler_rejection> & out);
+
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 
